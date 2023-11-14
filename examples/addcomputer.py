@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# Copyright (C) 2023 Fortra. All rights reserved.
+# SECUREAUTH LABS. Copyright (C) 2021 SecureAuth Corporation. All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -40,6 +40,7 @@ import sys
 import string
 import random
 import ssl
+import os
 from binascii import unhexlify
 
 
@@ -66,6 +67,7 @@ class ADDCOMPUTER:
         self.__targetIp = cmdLineOptions.dc_ip
         self.__baseDN = cmdLineOptions.baseDN
         self.__computerGroup = cmdLineOptions.computer_group
+        self.__ldap_channel_binding = cmdLineOptions.ldap_channel_binding
 
         if self.__targetIp is not None:
             self.__kdcHost = self.__targetIp
@@ -148,23 +150,46 @@ class ADDCOMPUTER:
             connectTo = self.__targetIp
         try:
             user = '%s\\%s' % (self.__domain, self.__username)
-            tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2, ciphers='ALL:@SECLEVEL=0')
+            tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2)
             try:
-                ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
                 if self.__doKerberos:
+                    ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
                     ldapConn = ldap3.Connection(ldapServer)
                     self.LDAP3KerberosLogin(ldapConn, self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash,
                                                  self.__aesKey, kdcHost=self.__kdcHost)
-                elif self.__hashes is not None:
-                    ldapConn = ldap3.Connection(ldapServer, user=user, password=self.__hashes, authentication=ldap3.NTLM)
+                elif self.__ldap_channel_binding:
+                    if not hasattr(ldap3, 'TLS_CHANNEL_BINDING'):
+                        raise Exception("To use LDAP channel binding, install the "
+                            "patched ldap3 module: pip3 install git+https://github.com/ly4k/ldap3")
+                    channel_binding = {"channel_binding": ldap3.TLS_CHANNEL_BINDING}
+                    tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2, ciphers='ALL:@SECLEVEL=0')
+                    ldapServer = ldap3.Server(
+                        connectTo,
+                        use_ssl=True,
+                        port=self.__port,
+                        get_info=ldap3.ALL,
+                        tls=tls
+                    )
+                    ldapConn = ldap3.Connection(
+                        ldapServer,
+                        user=user,
+                        password=self.__hashes if self.__hashes is not None else self.__password,
+                        authentication=ldap3.NTLM,
+                        auto_referrals=False,
+                        **channel_binding
+                    )
                     ldapConn.bind()
                 else:
-                    ldapConn = ldap3.Connection(ldapServer, user=user, password=self.__password, authentication=ldap3.NTLM)
+                    ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
+                    ldapConn = ldap3.Connection(ldapServer, user=user, password=self.__hashes if self.__hashes is not None else self.__password, authentication=ldap3.NTLM)
                     ldapConn.bind()
+                    if ldapConn.result['result'] == 8:
+                        raise Exception('strongerAuthRequired error received, '
+                            'try using -ldap-channel-binding option')
 
             except ldap3.core.exceptions.LDAPSocketOpenError:
                 #try tlsv1
-                tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1, ciphers='ALL:@SECLEVEL=0')
+                tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1)
                 ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
                 if self.__doKerberos:
                     ldapConn = ldap3.Connection(ldapServer)
@@ -306,9 +331,43 @@ class ADDCOMPUTER:
         if TGT is not None or TGS is not None:
             useCache = False
 
-        targetName = 'ldap/%s' % self.__target
         if useCache:
-            domain, user, TGT, TGS = CCache.parseFile(domain, user, targetName)
+            try:
+                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
+            except Exception as e:
+                # No cache present
+                print(e)
+                pass
+            else:
+                # retrieve domain information from CCache file if needed
+                if domain == '':
+                    domain = ccache.principal.realm['data'].decode('utf-8')
+                    logging.debug('Domain retrieved from CCache: %s' % domain)
+
+                logging.debug('Using Kerberos Cache: %s' % os.getenv('KRB5CCNAME'))
+                principal = 'ldap/%s@%s' % (self.__target.upper(), domain.upper())
+
+                creds = ccache.getCredential(principal)
+                if creds is None:
+                    # Let's try for the TGT and go from there
+                    principal = 'krbtgt/%s@%s' % (domain.upper(), domain.upper())
+                    creds = ccache.getCredential(principal)
+                    if creds is not None:
+                        TGT = creds.toTGT()
+                        logging.debug('Using TGT from cache')
+                    else:
+                        logging.debug('No valid credentials found in cache')
+                else:
+                    TGS = creds.toTGS(principal)
+                    logging.debug('Using TGS from cache')
+
+                # retrieve user information from CCache file if needed
+                if user == '' and creds is not None:
+                    user = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
+                    logging.debug('Username retrieved from CCache: %s' % user)
+                elif user == '' and len(ccache.principal.components) > 0:
+                    user = ccache.principal.components[0]['data'].decode('utf-8')
+                    logging.debug('Username retrieved from CCache: %s' % user)
 
         # First of all, we need to get a TGT for the user
         userName = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -322,7 +381,7 @@ class ADDCOMPUTER:
             sessionKey = TGT['sessionKey']
 
         if TGS is None:
-            serverName = Principal(targetName, type=constants.PrincipalNameType.NT_SRV_INST.value)
+            serverName = Principal('ldap/%s' % self.__target, type=constants.PrincipalNameType.NT_SRV_INST.value)
             tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdcHost, tgt, cipher,
                                                                     sessionKey)
         else:
@@ -378,9 +437,8 @@ class ADDCOMPUTER:
         request = ldap3.operation.bind.bind_operation(connection.version, ldap3.SASL, user, None, 'GSS-SPNEGO', blob.getData())
 
         # Done with the Kerberos saga, now let's get into LDAP
-        # try to open connection if closed
-        if connection.closed:
-            connection.open(read_server_info=False)
+        if connection.closed:  # try to open connection if closed
+                connection.open(read_server_info=False)
 
         connection.sasl_in_progress = True
         response = connection.post_send_single_response(connection.send('bindRequest', request, None))
@@ -583,6 +641,8 @@ if __name__ == '__main__':
     group.add_argument('-dc-ip', action='store',metavar = "ip",  help='IP of the domain controller to use. '
                                                                       'Useful if you can\'t translate the FQDN.'
                                                                       'specified in the account parameter will be used')
+    group.add_argument('-ldap-channel-binding', action="store_true", help='Use LDAP channel binding, may be required depending '
+                                                                            'on server configuration.')
 
 
     if len(sys.argv)==1:
